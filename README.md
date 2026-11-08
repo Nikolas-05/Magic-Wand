@@ -21,3 +21,8 @@ python pen_recorder.py live
 python pen_recorder.py record --writer yourname --reps 10
 python pen_recorder.py export
 ```
+
+## Resources
+
+- Training data: https://huggingface.co/datasets/FelixOtt/OnHW_datasets
+- Similar code: https://github.com/vahinitech/imu2text
