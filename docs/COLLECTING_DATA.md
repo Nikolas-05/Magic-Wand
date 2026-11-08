@@ -23,17 +23,18 @@ That's fine, because recognizers don't need position. Two approaches work well:
 
 - Arduino Nano 33 BLE Sense **Rev2** (the one with BMI270 + BMM150).
 - Optional, but strongly recommended: a momentary push button between **D2** and **GND**. Hold it while writing a letter. This "pen down" signal is by far the most reliable way to cut recordings into letters, and the public datasets use one too. No resistor is needed (the sketch uses the internal pull-up).
+- Optional: a force sensor (FSR) in the grip on **A0**, so squeezing the pen works as pen-down too. See [FORCE_SENSOR.md](FORCE_SENSOR.md) for wiring and placement. With no FSR wired, set `USE_FORCE_SENSOR` to 0 in the sketch.
 - Mount the board firmly on the pen, with its long edge along the pen. Keep the same mounting for every recording session, because the model learns the axes.
 - For wireless use: a small LiPo or a USB power bank.
 
-LEDs: **green** means ready and advertising over BLE, **blue** means a BLE client is connected, **orange** lights while the button is held, and a **fast red blink** means the IMU wasn't found.
+LEDs: **green** means ready and advertising over BLE, **blue** means a BLE client is connected, **orange** lights while the pen is down (button held or grip squeezed), and a **fast red blink** means the IMU wasn't found.
 
 ## 2. Flash the firmware
 
 1. Arduino IDE → Boards Manager → install **Arduino Mbed OS Nano Boards**.
 2. Library Manager → install **Arduino_BMI270_BMM150** and **ArduinoBLE**.
 3. Open `firmware/MagicWandPen/MagicWandPen.ino`, select *Arduino Nano 33 BLE*, and upload.
-4. Optional check: open the Serial Monitor at 115200. You should see lines like `1234,0.0123,-0.0040,1.0011,0.31,-0.12,0.05,21.3,-4.0,-38.2,0`. **Close the Serial Monitor before running the recorder**, because only one program can hold the port.
+4. Optional check: open the Serial Monitor at 115200. You should see lines like `1234,0.0123,-0.0040,1.0011,0.31,-0.12,0.05,21.3,-4.0,-38.2,0,25`. **Close the Serial Monitor before running the recorder**, because only one program can hold the port.
 
 ## 3. Set up Python (once)
 
@@ -63,6 +64,7 @@ The recorder asks for letters in random order (`[3/260] Write: K`). For each one
 - `r` deletes the last sample so you can redo it, `s` skips a letter, and `q` quits.
 - Sessions resume: running the same command again only records what's still missing. Raise `--reps` to collect more.
 - `--letters AEIOU` records a subset. `--ble` records wirelessly.
+- Using the force sensor? Add `--pendown force` (or `either`) and your thresholds, e.g. `--force-on 900 --force-off 600`. See [FORCE_SENSOR.md](FORCE_SENSOR.md#6-tune-the-thresholds-and-record).
 - No button? Use `--trigger key` (SPACE to start, SPACE to stop) or `--trigger motion` (it starts when you move and stops after you hold still for 0.4 s).
 - `--rate 50` records at 50 Hz to match the Kaggle and IIT datasets. The default of 100 Hz keeps more detail, and `export` resamples anyway.
 
@@ -81,7 +83,7 @@ data/
   raw/<writer>/<LETTER>/<LETTER>_<time>.csv
 ```
 
-Each raw CSV has `t_s, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, mx_uT, my_uT, mz_uT, btn`, starting 0.1 s before the button press.
+Each raw CSV has `t_s, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, mx_uT, my_uT, mz_uT, btn, force`, starting 0.1 s before pen-down. `btn` is the pen-down flag and `force` is grip force in ADC counts (0 without a sensor).
 
 ## 6. Look at a sample
 
@@ -100,7 +102,7 @@ python pen_recorder.py export
 | File | Contents | Use it with |
 |---|---|---|
 | `export_kaggle_100x6.csv` | `label`, then 100 steps × `ax ay az gx gy gz` interleaved (`ax_0, ay_0, …, gz_99`), in **m/s² and rad/s**, plus `writer`, `source_file` | Same layout and units as the Kaggle "Air-Writing Gestures A–Z" CSV, so you can stack the two. Drop the last two columns first. |
-| `export_full_100x9.csv` | Same, but 9 channels including the magnetometer, in g, °/s, µT | Your own models |
+| `export_full_100x10.csv` | Same, but 10 channels: motion, magnetometer and grip force, in g, °/s, µT, ADC counts | Your own models |
 | `export_strokes.json` | 2D pen path per sample (`strokePoints: [{x, y}]`, in degrees) | Stroke-raster models (magic_wand / virtual-notepad style) |
 
 When you mix datasets, remember that the axes are oriented differently on every board (the Kaggle set used an MPU-6050 on a glove). Fine-tune on your own pen's data at the end, because that usually matters more than the total amount of data.
@@ -109,7 +111,7 @@ When you mix datasets, remember that the axes are oriented differently on every 
 
 Name `MagicWandPen`, service `6e400000-b5a3-f393-e0a9-e50e24dc4179`.
 
-- `…0001` (notify): 20 bytes per sample, little endian: `uint8 seq, uint8 flags (bit0 = button), int16 ax ay az (mg), int16 gx gy gz (0.1 °/s), int16 mx my mz (0.1 µT)`.
-- `…0002` (write): ASCII commands. `r,50` sets the rate (100/50/25/20/10 Hz), and `i` makes the pen print its ID over USB.
+- `…0001` (notify): 22 bytes per sample, little endian: `uint8 seq, uint8 flags (bit0 = pen down, bit1 = button, bit2 = force pressed), int16 ax ay az (mg), int16 gx gy gz (0.1 °/s), int16 mx my mz (0.1 µT), uint16 force (ADC counts)`. If the BLE packet size isn't raised, only the first 20 bytes arrive (no force).
+- `…0002` (write): ASCII commands. `r,50` sets the rate (100/50/25/20/10 Hz), and `p,0|1|2` picks the pen-down source (button / force / either), `f,<on>,<off>` sets force thresholds, and `i` makes the pen print its ID and settings over USB.
 
 USB serial uses the same commands at 115200 baud and streams the CSV line format shown above.

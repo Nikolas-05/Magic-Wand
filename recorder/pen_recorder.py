@@ -16,12 +16,15 @@ Connection (all commands that talk to the pen)
   --ble              Bluetooth LE instead of USB (needs `pip install bleak`)
 
 Triggers for `record` (how a letter's start/end is detected)
-  --trigger button   hold the button on D2 while writing (default, most reliable)
+  --trigger button   use the pen's "pen down" flag (default, most reliable): hold the
+                     D2 button and/or squeeze the force sensor while writing
+  --pendown MODE     what counts as pen down: button, force, or either (default)
+  --force-on N --force-off N   force thresholds in ADC counts (see `live`)
   --trigger key      press SPACE to start a letter, SPACE again to stop
   --trigger motion   starts when the pen moves, stops after it is still for 0.4 s
 
 Each sample is saved as data/raw/<writer>/<LETTER>/<LETTER>_<time>.csv with columns
-  t_s, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, mx_uT, my_uT, mz_uT, btn
+  t_s, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, mx_uT, my_uT, mz_uT, btn, force
 and listed in data/index.csv.
 """
 
@@ -42,23 +45,25 @@ from pathlib import Path
 import numpy as np
 
 COLUMNS = ["t_s", "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps",
-           "mx_uT", "my_uT", "mz_uT", "btn"]
+           "mx_uT", "my_uT", "mz_uT", "btn", "force"]
 G = 9.80665
 
 BLE_NAME = "MagicWandPen"
 BLE_DATA_UUID = "6e400001-b5a3-f393-e0a9-e50e24dc4179"
 BLE_CMD_UUID = "6e400002-b5a3-f393-e0a9-e50e24dc4179"
 BLE_STRUCT = struct.Struct("<BB9h")          # 20 bytes, see the sketch header
+BLE_FORCE = struct.Struct("<H")              # bytes 20-21 (firmware 1.1+), if the MTU allows
 
 ARDUINO_VIDS = {0x2341, 0x2A03}
 
 
 # --------------------------------------------------------------------------
-# Sources: produce rows [t_s, ax, ay, az, gx, gy, gz, mx, my, mz, btn]
+# Sources: produce rows [t_s, ax, ay, az, gx, gy, gz, mx, my, mz, btn, force]
 # --------------------------------------------------------------------------
 class Source:
     def __init__(self, rate):
         self.rate = rate
+        self.setup_cmds = []         # extra commands sent on connect (pen-down mode etc.)
         self.q = queue.Queue(maxsize=20000)
         self.stop_flag = threading.Event()
         self.status = ""
@@ -98,7 +103,7 @@ def find_pen_port():
 
 
 class SerialSource(Source):
-    def __init__(self, port, rate):
+    def __init__(self, port, rate, setup_cmds=()):
         super().__init__(rate)
         import serial
         self.port = port or find_pen_port()
@@ -112,7 +117,8 @@ class SerialSource(Source):
                      "Close the Arduino Serial Monitor/Plotter if it is open.")
         time.sleep(0.3)
         self.ser.reset_input_buffer()
-        self.ser.write(f"r,{rate}\n".encode())
+        for c in [f"r,{rate}", *setup_cmds]:
+            self.ser.write(f"{c}\n".encode())
 
     def _run(self):
         t0_ms = None
@@ -129,12 +135,14 @@ class SerialSource(Source):
                 self.status = line
                 continue
             parts = line.split(",")
-            if len(parts) != 11:
+            if len(parts) not in (11, 12):     # 11 = firmware 1.0 (no force column)
                 continue
             try:
                 vals = [float(x) for x in parts]
             except ValueError:
                 continue
+            if len(vals) == 11:
+                vals.append(0.0)
             ms = vals[0]
             if last_ms is not None and ms - last_ms > 1.5 * 1000.0 / self.rate:
                 self.dropped += int(round((ms - last_ms) * self.rate / 1000.0)) - 1
@@ -147,8 +155,9 @@ class SerialSource(Source):
 
 
 class BLESource(Source):
-    def __init__(self, rate, address=None):
+    def __init__(self, rate, address=None, setup_cmds=()):
         super().__init__(rate)
+        self.setup_cmds = list(setup_cmds)
         try:
             import bleak  # noqa: F401
         except ImportError:
@@ -191,11 +200,13 @@ class BLESource(Source):
                    v[0] / 1000.0, v[1] / 1000.0, v[2] / 1000.0,
                    v[3] / 10.0, v[4] / 10.0, v[5] / 10.0,
                    v[6] / 10.0, v[7] / 10.0, v[8] / 10.0,
-                   float(flags & 1)]
+                   float(flags & 1),
+                   float(BLE_FORCE.unpack_from(data, 20)[0]) if len(data) >= 22 else 0.0]
             self._put(row)
 
         async with BleakClient(dev) as client:
-            await client.write_gatt_char(BLE_CMD_UUID, f"r,{self.rate}".encode(), response=False)
+            for c in [f"r,{self.rate}", *self.setup_cmds]:
+                await client.write_gatt_char(BLE_CMD_UUID, c.encode(), response=False)
             await client.start_notify(BLE_DATA_UUID, on_data)
             self.status = f"# BLE connected to {getattr(dev, 'address', dev)}"
             self.ready.set()
@@ -205,8 +216,26 @@ class BLESource(Source):
                 self.status = "BLE disconnected"
 
 
+def pen_commands(args):
+    """Commands that configure the pen's pen-down trigger, from --pendown/--force-on/--force-off."""
+    cmds = []
+    mode = getattr(args, "pendown", None)
+    if mode:
+        cmds.append(f"p,{ {'button': 0, 'force': 1, 'either': 2}[mode] }")
+    on, off = getattr(args, "force_on", None), getattr(args, "force_off", None)
+    if on is not None or off is not None:
+        on = on if on is not None else 700
+        off = off if off is not None else int(on * 0.65)
+        if not 0 <= off < on <= 4095:
+            sys.exit("--force-on must be larger than --force-off (both 0..4095)")
+        cmds.append(f"f,{on},{off}")
+    return cmds
+
+
 def open_source(args):
-    src = BLESource(args.rate, args.address) if args.ble else SerialSource(args.port, args.rate)
+    cmds = pen_commands(args)
+    src = (BLESource(args.rate, args.address, cmds) if args.ble
+           else SerialSource(args.port, args.rate, cmds))
     src.start()
     return src
 
@@ -334,7 +363,8 @@ def save_sample(out_dir, writer, label, rows):
         w = csv.writer(f)
         w.writerow(COLUMNS)
         for r in rows:
-            w.writerow([f"{r[0] - t0:.3f}"] + [f"{x:.4f}" for x in r[1:10]] + [int(r[10])])
+            w.writerow([f"{r[0] - t0:.3f}"] + [f"{x:.4f}" for x in r[1:10]]
+                       + [int(r[10]), int(r[11])])
     index = Path(out_dir) / "index.csv"
     new = not index.exists()
     with open(index, "a", newline="") as f:
@@ -389,7 +419,7 @@ def cmd_live(args):
                 amag = math.sqrt(r[1] ** 2 + r[2] ** 2 + r[3] ** 2)
                 print(f"\ra=({r[1]:+.2f},{r[2]:+.2f},{r[3]:+.2f})g |a|={amag:.2f}  "
                       f"g=({r[4]:+7.1f},{r[5]:+7.1f},{r[6]:+7.1f})dps  "
-                      f"m=({r[7]:+6.1f},{r[8]:+6.1f},{r[9]:+6.1f})uT  btn={int(r[10])}  "
+                      f"m=({r[7]:+6.1f},{r[8]:+6.1f},{r[9]:+6.1f})uT  pen={int(r[10])} force={int(r[11]):4d}  "
                       f"dropped={src.dropped}   ", end="", flush=True)
                 last = time.time()
     except KeyboardInterrupt:
@@ -413,7 +443,7 @@ def cmd_record(args):
     src = open_source(args)
     seg_cls = {"button": ButtonSegmenter, "key": KeySegmenter, "motion": MotionSegmenter}[args.trigger]
     seg = seg_cls(args.rate)
-    how = {"button": "hold the pen button while writing, release when done",
+    how = {"button": "hold the button / squeeze the grip while writing, let go when done",
            "key": "press SPACE, write, press SPACE again",
            "motion": "write the letter, then hold still for half a second"}[args.trigger]
 
@@ -544,7 +574,11 @@ def pen_path(data, pen_axis="x", kp=0.5):
 
 
 def load_sample(path):
-    return np.loadtxt(path, delimiter=",", skiprows=1)
+    """Load a raw sample; files from firmware 1.0 (no force column) get force = 0."""
+    d = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
+    if d.shape[1] == 11:
+        d = np.column_stack([d, np.zeros(len(d))])
+    return d
 
 
 def cmd_plot(args):
@@ -555,7 +589,8 @@ def cmd_plot(args):
         x = -x
     if args.flip_y:
         y = -y
-    fig, ax = plt.subplots(1, 3, figsize=(14, 4))
+    has_force = bool(np.any(data[:, 11] > 0))
+    fig, ax = plt.subplots(1, 4 if has_force else 3, figsize=(18 if has_force else 14, 4))
     t = data[:, 0]
     for k, n in zip(range(1, 4), "xyz"):
         ax[0].plot(t, data[:, k], label=f"a{n}")
@@ -569,6 +604,11 @@ def cmd_plot(args):
     ax[2].plot(x, y, lw=0.8, alpha=0.5)
     ax[2].set(title="Pen pointing path (deg)", aspect="equal")
     fig.colorbar(sc, ax=ax[2], label="s")
+    if has_force:
+        ax[3].plot(t, data[:, 11], color="tab:red", label="force")
+        ax[3].fill_between(t, 0, data[:, 10] * data[:, 11].max(), alpha=0.15, label="pen down")
+        ax[3].set(title="Grip force (ADC counts)", xlabel="s")
+        ax[3].legend()
     fig.suptitle(Path(args.file).name)
     plt.tight_layout()
     plt.show()
@@ -603,15 +643,15 @@ def cmd_export(args):
             w.writerow([p.parent.name] + [f"{v:.5f}" for v in feat]
                        + [p.parent.parent.name, p.relative_to(out).as_posix()])
 
-    # 2) Same, plus magnetometer, in the recorder's native units (g, deg/s, uT)
-    full = out / f"export_full_{n}x9.csv"
+    # 2) Same, plus magnetometer and grip force, in native units (g, deg/s, uT, ADC counts)
+    full = out / f"export_full_{n}x10.csv"
     with open(full, "w", newline="") as f:
         w = csv.writer(f)
-        names = ("ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "mx_uT", "my_uT", "mz_uT")
+        names = ("ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "mx_uT", "my_uT", "mz_uT", "force")
         w.writerow(["label"] + [f"{c}_{i}" for i in range(n) for c in names] + ["writer", "source_file"])
         for p in files:
             d = resample(load_sample(p), n)
-            w.writerow([p.parent.name] + [f"{v:.4f}" for v in d[:, 1:10].reshape(-1)]
+            w.writerow([p.parent.name] + [f"{v:.4f}" for v in d[:, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11]].reshape(-1)]
                        + [p.parent.parent.name, p.relative_to(out).as_posix()])
 
     # 3) Stroke JSON (2D pen path), for stroke/raster models like TFLM magic_wand
@@ -640,6 +680,10 @@ def main():
         p.add_argument("--ble", action="store_true", help="use Bluetooth LE instead of USB")
         p.add_argument("--address", help="BLE address (default: scan for MagicWandPen)")
         p.add_argument("--rate", type=int, default=100, choices=[100, 50, 25, 20, 10], help="Hz")
+        p.add_argument("--pendown", choices=["button", "force", "either"],
+                       help="what the pen treats as pen down (default: keep the pen's setting)")
+        p.add_argument("--force-on", type=int, help="force sensor press threshold, ADC counts")
+        p.add_argument("--force-off", type=int, help="force sensor release threshold, ADC counts")
 
     p = sub.add_parser("ports", help="list serial ports")
     p.set_defaults(func=cmd_ports)

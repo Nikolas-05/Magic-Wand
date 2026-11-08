@@ -6,9 +6,10 @@ Air-writing pen built on the Arduino Nano 33 BLE Sense Rev2 (BMI270 + BMM150): w
 
 | Path | What it is |
 |---|---|
-| `firmware/MagicWandPen/` | Arduino sketch that streams accel/gyro/mag + a pen-button flag over USB and Bluetooth LE |
+| `firmware/MagicWandPen/` | Arduino sketch that streams accel/gyro/mag, grip force and a pen-down flag over USB and Bluetooth LE |
 | `recorder/pen_recorder.py` | PC tool that records labeled letter samples, plots them, and exports training CSVs |
 | `docs/COLLECTING_DATA.md` | Step-by-step guide to collecting training data |
+| `docs/FORCE_SENSOR.md` | Wiring a force sensor (FSR) into the pen grip as a squeeze-to-write trigger |
 | `ArduinoDAQ.py` | Original generic serial data-acquisition class |
 
 Quick start: flash the sketch, then
