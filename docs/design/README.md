@@ -9,7 +9,7 @@ Dimensioned drawings of a handheld wand/pen that holds the Arduino Nano 33 BLE S
 | [`03_exploded_and_parts.svg`](03_exploded_and_parts.svg) | Exploded view and parts list with sizes |
 | [`04_wiring.svg`](04_wiring.svg) | Where each wire runs inside the pen, and the schematic |
 
-Each sheet also has a `.png` copy. To change a dimension, edit the numbers at the top of `make_drawings.py` and run `python make_drawings.py .` (writes the SVGs into the folder you pass).
+Each sheet also has a `.png` copy in the `Sketches` folder at the top of the repo. To change a dimension, edit the numbers at the top of `make_drawings.py` and run `python make_drawings.py .` (writes the SVGs into the folder you pass).
 
 ## Layout at a glance
 
