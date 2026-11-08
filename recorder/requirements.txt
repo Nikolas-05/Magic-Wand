@@ -1,0 +1,4 @@
+pyserial>=3.5
+numpy>=1.23
+bleak>=0.22      # only needed for --ble
+matplotlib>=3.6  # only needed for the plot command
