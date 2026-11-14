@@ -211,12 +211,33 @@ def letter_features(acc_pen, gyr_pen):
 # =====================================================================================
 #  Model: small numpy MLP + nearest raw letters for comparison
 # =====================================================================================
+RAW_DIR = None                 # set to the full path of an onhw2_upper_indep_N folder to skip the search
+ 
+ 
 def find_raw_folder():
-    for base in (HERE, os.path.dirname(HERE), os.getcwd(), os.path.dirname(os.getcwd())):
-        p = os.path.join(base, "Raw data set", RAW_FOLDER)
-        if os.path.isfile(os.path.join(p, "X_train.npy")):
-            return p
-    raise FileNotFoundError(f"Couldn't find 'Raw data set/{RAW_FOLDER}' next to or above {HERE}")
+    """Look for the raw data next to / above this script (any upper fold 0-4 works)."""
+    if RAW_DIR and os.path.isfile(os.path.join(RAW_DIR, "X_train.npy")):
+        return RAW_DIR
+    bases = []
+    for b in (HERE, os.path.dirname(HERE), os.getcwd(), os.path.dirname(os.getcwd())):
+        if b not in bases:
+            bases.append(b)
+    empty = []
+    for base in bases:
+        for fold in [RAW_FOLDER] + [f"onhw2_upper_indep_{i}" for i in range(5)]:
+            p = os.path.join(base, "Raw data set", fold)
+            if os.path.isfile(os.path.join(p, "X_train.npy")) and os.path.isfile(os.path.join(p, "y_train.npy")):
+                return p
+            if os.path.isdir(p) and p not in empty:
+                empty.append(p)
+    if empty:
+        raise FileNotFoundError(
+            "The 'Raw data set' folders are there but have no .npy files in them, e.g.\n  " + empty[0] +
+            "\nPut X_train.npy, y_train.npy, X_test.npy, y_test.npy back in that folder (OneDrive or a git "
+            "clean/checkout may have removed them; they aren't tracked by git), or set RAW_DIR at the top "
+            "of the script. If letter_model.npz is next to this script, the raw data isn't needed at all.")
+    raise FileNotFoundError(f"Couldn't find 'Raw data set/{RAW_FOLDER}' next to or above {HERE}. "
+                            "Set RAW_DIR at the top of the script to where it is.")
  
  
 def _random_rotations(n, deg, rng):
