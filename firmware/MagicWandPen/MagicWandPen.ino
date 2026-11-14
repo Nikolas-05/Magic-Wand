@@ -1,14 +1,18 @@
 /*
   MagicWandPen.ino
   Streams motion data from an Arduino Nano 33 BLE Sense Rev2 (BMI270 accel/gyro
-  + BMM150 magnetometer) over USB serial AND Bluetooth LE at the same time.
+  + BMM150 magnetometer) over USB serial, and also Bluetooth LE when USE_BLE is 1.
 
   Libraries (Arduino IDE > Library Manager):
     - Arduino_BMI270_BMM150
-    - ArduinoBLE
+    - ArduinoBLE (only needed when USE_BLE is 1)
   Board package: "Arduino Mbed OS Nano Boards" -> Arduino Nano 33 BLE
 
-  "Pen down" inputs (either or both, see docs/FORCE_SENSOR.md):
+  Works on a bare board over USB: the button and force sensor below are OFF by
+  default (USE_BUTTON / USE_FORCE_SENSOR = 0). Then btn and force are always 0
+  and the 9 IMU axes stream as normal.
+
+  Optional "pen down" inputs (either or both, see docs/FORCE_SENSOR.md):
     - Push button between D2 and GND (internal pull-up, no resistor needed).
     - Force sensor (FSR) on A0 as a voltage divider:
           3.3V ---[FSR]---+--- A0
@@ -58,14 +62,22 @@
   ---------------------------------------------------------------------------
 */
 
-#include <Arduino_BMI270_BMM150.h>
-#include <ArduinoBLE.h>
+// ---- Bluetooth: OFF for the USB-only live test. ArduinoBLE is most of the sketch's
+// flash, so leaving it out roughly halves the size. Set to 1 for wireless use. ----
+#define USE_BLE           0
 
-#define FW_VERSION        "1.1"
+#include <Arduino_BMI270_BMM150.h>
+#if USE_BLE
+#include <ArduinoBLE.h>
+#endif
+
+#define FW_VERSION        "1.3"
+// ---- optional extra hardware: all OFF so a bare Nano 33 BLE Sense Rev2 works on its own ----
+#define USE_BUTTON        0      // 1 if a push button is wired D2 -> GND
 #define BUTTON_PIN        2      // D2 -> button -> GND
 #define SENSOR_HZ         100    // BMI270 output data rate set by the library
 
-#define USE_FORCE_SENSOR  1      // 0 if no FSR is wired to FORCE_PIN
+#define USE_FORCE_SENSOR  0      // 1 if an FSR is wired to FORCE_PIN (see docs/FORCE_SENSOR.md)
 #define FORCE_PIN         A0     // FSR divider midpoint
 #define FORCE_ON_DEFAULT  700    // counts: squeeze above this = pen down
 #define FORCE_OFF_DEFAULT 450    // counts: relax below this  = pen up
@@ -73,10 +85,12 @@
 
 #define PACKET_LEN        22
 
+#if USE_BLE
 // ---- BLE ----
 BLEService penService("6e400000-b5a3-f393-e0a9-e50e24dc4179");
 BLECharacteristic dataChar("6e400001-b5a3-f393-e0a9-e50e24dc4179", BLERead | BLENotify, PACKET_LEN, true);
 BLECharacteristic cmdChar ("6e400002-b5a3-f393-e0a9-e50e24dc4179", BLEWrite | BLEWriteWithoutResponse, 20, false);
+#endif
 
 // ---- state ----
 float ax, ay, az, gx, gy, gz;
@@ -147,7 +161,9 @@ void handleCommand(String cmd) {
 
 void setup() {
   Serial.begin(115200);
+#if USE_BUTTON
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+#endif
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(LEDR, OUTPUT); pinMode(LEDG, OUTPUT); pinMode(LEDB, OUTPUT);
   setRgb(false, false, false);
@@ -166,6 +182,7 @@ void setup() {
     }
   }
 
+#if USE_BLE
   if (BLE.begin()) {
     BLE.setLocalName("MagicWandPen");
     BLE.setDeviceName("MagicWandPen");
@@ -178,7 +195,8 @@ void setup() {
     BLE.advertise();
     bleOk = true;
   }
-  setRgb(false, true, false);       // green = ready, advertising
+#endif
+  setRgb(false, true, false);       // green = ready (and advertising, if USE_BLE)
   printId();
 }
 
@@ -209,6 +227,7 @@ void emitSample() {
     Serial.println(force);
   }
 
+#if USE_BLE
   if (bleOk && BLE.connected() && dataChar.subscribed()) {
     uint8_t p[PACKET_LEN];
     p[0] = seq;
@@ -228,11 +247,16 @@ void emitSample() {
     memcpy(p + 20, &force, 2);
     dataChar.writeValue(p, sizeof(p));
   }
+#endif
   seq++;
 }
 
 void updatePenState() {
+#if USE_BUTTON
   btnDown = digitalRead(BUTTON_PIN) == LOW;
+#else
+  btnDown = false;                  // no button wired
+#endif
 
 #if USE_FORCE_SENSOR
   int raw = analogRead(FORCE_PIN);
@@ -251,6 +275,7 @@ void updatePenState() {
 }
 
 void loop() {
+#if USE_BLE
   // ---- BLE housekeeping + commands ----
   if (bleOk) {
     BLE.poll();
@@ -264,6 +289,7 @@ void loop() {
       handleCommand(String(buf));
     }
   }
+#endif
   while (Serial && Serial.available()) {
     char ch = Serial.read();
     if (ch == '\n') { handleCommand(serialLine); serialLine = ""; }

@@ -1,27 +1,3 @@
-# # -*- coding: utf-8 -*-
-# """
-# Created on Sat Nov  7 19:04:53 2026
-
-# @author: ramir
-# """
-# import asyncio
-# from bleak import BleakScanner, BleakClient
-
-# CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
-
-# def on_data(_, data: bytearray):
-#     print("Received:", data.decode())
-
-# async def main():
-#     device = await BleakScanner.find_device_by_name("MagicWand", timeout=10)
-#     if not device:
-#         print("Not found"); return
-#     async with BleakClient(device) as client:
-#         await client.start_notify(CHAR_UUID, on_data)
-#         await asyncio.sleep(60)   # listen for 60 s
-
-# asyncio.run(main())
-
 
 
 import asyncio
@@ -35,6 +11,7 @@ DEVICE_NAME = "Nano33-IMU"
 CHAR_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214"
 PACKET_FMT = "<Ifff"   # uint32 t_ms, float ax, ay, az (matches the Arduino struct)
 
+# COLUMNS = ["t_ms", "ax", "ay", "az", "gx", "gy", "gz", "mx", "my", "mz", "pen"]
 
 async def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else "imu_log.csv"
@@ -47,6 +24,7 @@ async def main():
 
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
+        # writer.writerow(COLUMNS)
         writer.writerow(["t_ms", "ax", "ay", "az"])
 
         def on_data(_, data: bytearray):

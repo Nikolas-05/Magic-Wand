@@ -1,0 +1,12 @@
+{
+  "vertical": {
+    "signal": "tilt_y",
+    "sign": -1,
+    "gain": 3.5095665769923468
+  },
+  "horizontal": {
+    "signal": "gyro_x",
+    "sign": 1,
+    "gain": 1.0
+  }
+}

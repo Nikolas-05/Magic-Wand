@@ -11,6 +11,7 @@ Air-writing pen built on the Arduino Nano 33 BLE Sense Rev2 (BMI270 + BMM150): w
 | `docs/COLLECTING_DATA.md` | Step-by-step guide to collecting training data |
 | `docs/FORCE_SENSOR.md` | Wiring a force sensor (FSR) into the pen grip as a squeeze-to-write trigger |
 | `docs/design/` | Dimensioned enclosure drawings: side and cross-sections, exploded view with parts list, wiring routing |
+| `compare_letter/` | Draw one letter (e.g. A) over Bluetooth and compare it to open air-writing data: overlay plots, DTW distance, nearest-letter check |
 | `ArduinoDAQ.py` | Original generic serial data-acquisition class |
 
 Quick start: flash the sketch, then
