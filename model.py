@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
 # ------------------------------------------------------------------ config
-ROOT = r'C:\Users\lando\Magic-Wand\onhw-chars_2021-06-30\onhw-chars_2021-06-30'
+ROOT = os.path.join(os.getcwd(), "onhw-chars_2021-06-30", "onhw-chars_2021-06-30")
 MODE = "both"                      # keep "both": the merge list is built for the combined letters
 FOLDS = [0, 1, 2, 3, 4]            # writer-independent folds (use [0] for a quick test)
 EPOCHS, BATCH, LR = 60, 64, 1e-3
