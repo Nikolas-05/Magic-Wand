@@ -3,9 +3,22 @@ predict_letter.py  -  write an uppercase letter with the Nano 33 BLE, watch the 
 motion signals live, and get a prediction learned from the OnHW "Raw data set".
  
 NO INTEGRATION: nothing is integrated (no gyro -> angle, no accel -> position), so
-nothing drifts. The window shows the accelerometer and gyro themselves, turned into the
-raw data's pen axes and low-pass filtered. The prediction uses the same signals, filtered
-with the same 5-sample moving average as the raw data.
+nothing drifts.
+  - Drawn path (left): a laser-pointer spot from where the pen tip points right now.
+    Up/down = tilt from gravity (accelerometer). Left/right = compass heading from the
+    BMM150 magnetometer, tilt-compensated with that same gravity. Both are low-pass
+    filtered, and accelerometer jolts are damped. Needs firmware/MagicWandPen (it streams
+    mx, my, mz over USB and Bluetooth).
+  - Traces (right): accelerometer and gyro in the raw data's pen axes, low-pass filtered.
+  - Prediction: the same accel + gyro signals, filtered with the same 5-sample moving
+    average as the raw data. The path is for you to look at; the model doesn't use it.
+ 
+COMPASS CALIBRATION (once per pen, saved to mag_calibration.json)
+  The first time, the window asks you to wave the pen slowly in big figure-8s, pointing
+  it in every direction, for ~8 s. That measures the magnetometer's offset (hard iron),
+  per-axis scale (soft iron), and which way its axes sit relative to the accelerometer.
+  Press M to redo it (e.g. after moving the battery or other metal in the pen). Keep away
+  from laptops, speakers and steel desks while writing: they bend the compass.
  
 Same connection and keys as live_draw.py (USB cable first, Bluetooth if no cable), works
 with firmware/MagicWandPen/MagicWandPen.ino. Only needs numpy, matplotlib, pyserial
@@ -57,6 +70,9 @@ KEYS (click on the plot window first)
   E          export recordings + predictions to predictions_<time>.json
   BACKSPACE  delete the last recording
   C          clear the finished letter (back to the scrolling view)
+  R          re-centre the path cursor
+  x / y      mirror the path left-right / up-down (display only, not the prediction)
+  M          redo the compass calibration
   B          recalibrate (hold the pen still in your grip)
   K          during calibration with REQUIRE_POSE_MATCH = True: accept your grip anyway
   Q          quit (or close the window)
@@ -117,6 +133,13 @@ SMOOTH_SAMPLES = 5           # moving average for the model, 50 ms (raw data get
 LIVE_SMOOTH = 0.25           # 0..1 low-pass for the live traces (~5 Hz at 100 Hz; smaller = smoother)
 GYRO_NOISE_DPS = 1.5         # live gyro traces: slower than this shows as 0 (display only)
 WINDOW_S = 3.0               # seconds of signal shown while not recording
+ 
+# ---------------- drawn path: tilt (accelerometer) + compass (magnetometer), no integration ----------------
+MAG_FILE = os.path.join(HERE, "mag_calibration.json")
+MAG_CAL_SECONDS = 8.0        # at least this long waving the pen for the magnetometer calibration
+PATH_SMOOTH = 0.2            # 0..1 low-pass on accel + compass for the path (smaller = smoother, more lag)
+JOLT_G = 0.15                # accel this far from 1 g = hand jolt: trust it 5x less for the tilt
+VIEW = 30.0                  # half-width of the path view, degrees
 MIN_RECORD_S = 0.15
 MIN_MOTION_DPS = 20.0        # trimming: slower than this (or 15% of the peak) counts as still
 LIVE_PREDICT_EVERY = 0.25    # s between predictions while writing
@@ -373,6 +396,136 @@ def pose_angles(up_pen):
  
  
 # =====================================================================================
+#  Magnetometer calibration (one time) for the drawn path: compass heading, no integration
+# =====================================================================================
+def _signed_permutations():
+    """All 48 axis swaps / sign flips, identity first (used to line the BMM150 up with the
+    BMI270: the two chips on the Nano are not guaranteed to share axes)."""
+    import itertools
+    out = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1, -1), repeat=3):
+            P = np.zeros((3, 3))
+            for r, (c, sg) in enumerate(zip(perm, signs)):
+                P[r, c] = sg
+            out.append(P)
+    return out
+ 
+ 
+class MagCalibration:
+    """Hard iron (offset), soft iron (per-axis scale) and the axis match to the accelerometer.
+    Saved to mag_calibration.json next to this script, so it is done once per pen."""
+ 
+    def __init__(self, offset=(0, 0, 0), scale=(1, 1, 1), axes=None, quality=None):
+        self.offset = np.asarray(offset, float)
+        self.scale = np.asarray(scale, float)
+        self.axes = np.eye(3) if axes is None else np.asarray(axes, float)
+        self.quality = quality
+ 
+    def apply(self, m):
+        return self.axes @ ((np.asarray(m, float) - self.offset) * self.scale)
+ 
+    @classmethod
+    def load(cls, path=MAG_FILE):
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            return cls(d["offset"], d["scale"], d["axes"], d.get("quality"))
+        except (OSError, ValueError, KeyError):
+            return None
+ 
+    def save(self, path=MAG_FILE):
+        with open(path, "w") as f:
+            json.dump({"offset": self.offset.round(3).tolist(), "scale": self.scale.round(4).tolist(),
+                       "axes": self.axes.astype(int).tolist(), "quality": self.quality}, f, indent=1)
+ 
+    @classmethod
+    def fit(cls, mags, accs):
+        """mags: raw readings (uT) while the pen was waved around; accs: accel at the same time."""
+        mags, accs = np.asarray(mags, float), np.asarray(accs, float)
+        # least-squares ellipsoid (axis-aligned): a x^2 + b y^2 + c z^2 + d x + e y + f z = 1.
+        # Works even if you didn't point the pen in every direction; min/max is the fallback.
+        lo, hi = mags.min(0), mags.max(0)
+        offset = (hi + lo) / 2
+        half = np.maximum((hi - lo) / 2, 1e-6)
+        mid = mags.mean(0)
+        sc = float(np.abs(mags - mid).max()) or 1.0
+        x = (mags - mid) / sc                                     # well-conditioned
+        A = np.c_[x ** 2, x]
+        coef = np.linalg.lstsq(A, np.ones(len(x)), rcond=None)[0]
+        if np.all(coef[:3] > 0):
+            c = -coef[3:] / (2 * coef[:3])
+            G = 1 + float(np.sum(coef[:3] * c ** 2))
+            if G > 0:
+                offset = mid + c * sc
+                half = np.sqrt(G / coef[:3]) * sc
+        scale = half.mean() / half
+        mc = (mags - offset) * scale
+        # which axis swap makes the field-to-gravity angle constant (it is, for the true match)?
+        g_ok = np.abs(np.linalg.norm(accs, axis=1) - 1) < 0.15
+        u = accs[g_ok] / np.linalg.norm(accs[g_ok], axis=1, keepdims=True)
+        mu = mc[g_ok] / np.linalg.norm(mc[g_ok], axis=1, keepdims=True)
+        best, best_sd, id_sd = np.eye(3), None, None
+        for P in _signed_permutations():
+            sd = float(np.std(np.einsum("ij,nj,ni->n", P, mu, u)))
+            if id_sd is None:
+                id_sd = sd
+            if best_sd is None or sd < best_sd - 1e-9:
+                best, best_sd = P, sd
+        if id_sd <= best_sd * 1.15:            # identity is as good: keep it
+            best, best_sd = np.eye(3), id_sd
+        return cls(offset, scale, best, {"dip_spread": round(best_sd, 3), "samples": int(len(mags)),
+                                         "field_uT": round(float(half.mean()), 1)})
+ 
+ 
+class MagCollector:
+    """Collects readings while you wave the pen; says when it has seen enough directions."""
+ 
+    def __init__(self):
+        self.mags, self.accs = [], []
+        self.t = 0.0
+        self._last = None
+ 
+    def add(self, dt, mag, acc):
+        self.t += dt
+        if mag is None:
+            return
+        mag = tuple(np.round(mag, 2))
+        if mag == self._last:                  # the BMM150 updates slower than 100 Hz: skip repeats
+            return
+        self._last = mag
+        self.mags.append(mag)
+        self.accs.append(acc)
+ 
+    def coverage(self):
+        """0..1: how evenly the field directions seen so far fill all 3 axes."""
+        if len(self.mags) < 20:
+            return 0.0
+        m = np.array(self.mags)
+        half = (m.max(0) - m.min(0)) / 2
+        if half.max() < 10:                    # less than 10 uT of change: barely moved
+            return 0.0
+        return float(half.min() / half.max())
+ 
+    def done(self):
+        return self.t >= MAG_CAL_SECONDS and self.coverage() >= 0.6 and len(self.mags) >= 80
+ 
+ 
+def tilt_heading(acc_board, mag_cal, tip_board):
+    """Where the pen tip points, from gravity + magnetic north only (no integration).
+    Returns (heading deg, clockwise from magnetic north; elevation deg, + = above horizontal)."""
+    up = _unit(acc_board)
+    east = np.cross(mag_cal, up)
+    if np.linalg.norm(east) < 1e-6:
+        return None
+    east = _unit(east)
+    north = np.cross(up, east)
+    t = _unit(tip_board)
+    return (math.degrees(math.atan2(t @ east, t @ north)),
+            math.degrees(math.asin(max(-1.0, min(1.0, float(t @ up))))))
+ 
+ 
+# =====================================================================================
 #  Tracker: gyro bias + rest grip -> pen-axis signals matched to the raw data (no integration)
 # =====================================================================================
 class PenTracker:
@@ -390,7 +543,49 @@ class PenTracker:
         self.to_pen = np.eye(3)                # board -> pen axes (incl. small pose alignment)
         self.rest_up = np.array([0, 0, 1.0])   # gravity direction in your rest grip (board axes)
         self.accept_any_pose = False
-        self.start_calibration()
+        # drawn path (tilt + compass)
+        self.mag_cal = MagCalibration.load()
+        self.mag_raw = None
+        self.acc_path = None                   # smoothed accel for the path (board axes)
+        self.mag_s = None                      # smoothed calibrated field (board axes)
+        self.tip = np.array([0, -1.0, 0])      # board axis of the pen tip (set by the grip)
+        self.heading = self.elev = 0.0
+        self.head_ref = self.elev_ref = 0.0
+        self.x = self.y = 0.0
+        self.flip_x = self.flip_y = 1.0
+        self.collector = None
+        self._need_recenter = True
+        if self.mag_cal is None:
+            self.start_mag_calibration()
+        else:
+            self.start_calibration()
+ 
+    def start_mag_calibration(self):
+        self.stage = "mag"
+        self.calibrated = False
+        self.collector = MagCollector()
+        self.status = "Compass calibration (once): wave the pen slowly in big figure-8s, every direction..."
+ 
+    def _mag_step(self, dt, acc, mag):
+        c = self.collector
+        c.add(dt, mag, acc)
+        if c.t > 3 and not c.mags:
+            self.status = "No magnetometer data from the pen, so no drawn path. Prediction still works."
+            self.collector = None
+            self.start_calibration()
+            return
+        if c.done():
+            self.mag_cal = MagCalibration.fit(c.mags, c.accs)
+            self.mag_cal.save()
+            q = self.mag_cal.quality
+            print(f"Compass calibrated: offset {np.round(self.mag_cal.offset, 1)} uT, scale "
+                  f"{np.round(self.mag_cal.scale, 2)}, axes {self.mag_cal.axes.astype(int).tolist()}, "
+                  f"field {q['field_uT']} uT, dip spread {q['dip_spread']} (small = good). Saved {MAG_FILE}")
+            self.collector = None
+            self.start_calibration()
+            return
+        self.status = (f"Compass calibration (once): wave the pen slowly in big figure-8s, every direction... "
+                       f"{c.t:.0f}/{MAG_CAL_SECONDS:.0f} s, coverage {c.coverage():.0%} (want 60%)")
  
     # ---------- calibration ----------
     def start_calibration(self):
@@ -466,6 +661,10 @@ class PenTracker:
         self.rest_up = _unit(mean[:3])
         self.acc_s = self.to_pen @ mean[:3]
         self.gyr_s = np.zeros(3)
+        self.tip = np.array([0, -s, 0])                         # the board end pointing at the paper
+        self.acc_path = mean[:3].copy()
+        self.mag_s = None
+        self._need_recenter = True
         self.stage = "ready"
         self.calibrated = True
         end = "+Y" if s < 0 else "-Y"
@@ -479,11 +678,16 @@ class PenTracker:
         return math.degrees(math.acos(max(-1, min(1, float(a @ self.rest_up)))))
  
     # ---------- every sample ----------
-    def update(self, dt, acc, gyr):
+    def update(self, dt, acc, gyr, mag=None):
         acc = np.asarray(acc, float)
         gyr = np.asarray(gyr, float)
         self.samples += 1
+        if mag is not None:
+            self.mag_raw = np.asarray(mag, float)
         self.acc_lp = acc.copy() if self.acc_lp is None else self.acc_lp + 0.1 * (acc - self.acc_lp)
+        if self.stage == "mag":
+            self._mag_step(dt, acc, mag)
+            return
         if self.stage == "hold":
             self._hold_step(dt, acc, gyr)
             return
@@ -493,6 +697,35 @@ class PenTracker:
         g_pen = np.where(np.abs(g_pen) < GYRO_NOISE_DPS, 0.0, g_pen)
         self.acc_s = self.acc_s + LIVE_SMOOTH * (a_pen - self.acc_s)
         self.gyr_s = self.gyr_s + LIVE_SMOOTH * (g_pen - self.gyr_s)
+        self._path_step(acc)
+ 
+    @property
+    def has_path(self):
+        return self.mag_cal is not None and self.mag_raw is not None
+ 
+    def _path_step(self, acc):
+        """Laser-pointer spot from where the tip points RIGHT NOW: up/down from gravity
+        (accelerometer), left/right from magnetic north (compass). Nothing is integrated."""
+        if not self.has_path:
+            return
+        k = PATH_SMOOTH if abs(np.linalg.norm(acc) - 1) < JOLT_G else PATH_SMOOTH / 5   # damp jolts
+        self.acc_path = acc.copy() if self.acc_path is None else self.acc_path + k * (acc - self.acc_path)
+        mc = self.mag_cal.apply(self.mag_raw)
+        self.mag_s = mc if self.mag_s is None else self.mag_s + PATH_SMOOTH * (mc - self.mag_s)
+        th = tilt_heading(self.acc_path, self.mag_s, self.tip)
+        if th is None:
+            return
+        self.heading += (th[0] - self.heading + 180) % 360 - 180    # unwrapped, no jump at +-180
+        self.elev = th[1]
+        if self._need_recenter:
+            self._need_recenter = False
+            self.recenter()
+        self.x = (self.heading - self.head_ref) * self.flip_x
+        self.y = (self.elev - self.elev_ref) * self.flip_y
+ 
+    def recenter(self):
+        self.head_ref, self.elev_ref = self.heading, self.elev
+        self.x = self.y = 0.0
  
     def _check_gyro_sign(self, dt, gyr):
         """Gravity seen by the accelerometer must turn the way the gyro says. If it turns the
@@ -562,8 +795,23 @@ class Canvas:
         self.hist_acc = deque(maxlen=n)        # smoothed, pen axes, rest gravity removed
         self.hist_gyr = deque(maxlen=n)
         plt.ion()
-        self.fig, (self.ax_a, self.ax_g) = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
-        self.fig.subplots_adjust(top=0.80, right=0.80, hspace=0.12)
+        self.fig = plt.figure(figsize=(13, 7))
+        gs = self.fig.add_gridspec(2, 2, width_ratios=(1, 1.15), left=0.06, right=0.97, top=0.84,
+                                   bottom=0.08, wspace=0.18, hspace=0.12)
+        self.ax_p = self.fig.add_subplot(gs[:, 0])
+        self.ax_a = self.fig.add_subplot(gs[0, 1])
+        self.ax_g = self.fig.add_subplot(gs[1, 1], sharex=self.ax_a)
+        self.ax_p.set_xlim(-VIEW, VIEW)
+        self.ax_p.set_ylim(-VIEW, VIEW)
+        self.ax_p.set_aspect("equal")
+        self.ax_p.grid(True, alpha=0.3)
+        self.ax_p.set_xlabel("left / right (deg, compass)")
+        self.ax_p.set_ylabel("down / up (deg, tilt)")
+        self.ax_p.set_title("Pen-tip path (tilt + compass, no integration)", fontsize=9)
+        self.path_line, = self.ax_p.plot([], [], "-", lw=3, color="tab:blue")
+        self.start_dot, = self.ax_p.plot([], [], "o", ms=7, color="tab:green")
+        self.cursor, = self.ax_p.plot([0], [0], "o", ms=10, color="tab:gray")
+        self.no_path = self.ax_p.text(0, 0, "", ha="center", va="center", fontsize=10, color="0.4")
         colors = ("tab:red", "tab:green", "tab:blue")
         names = ("x (right)", "y (along pen)", "z (underside)")
         self.lines_a = [self.ax_a.plot([], [], color=c, lw=1.8, label=nm)[0] for c, nm in zip(colors, names)]
@@ -575,9 +823,10 @@ class Canvas:
             ax.grid(True, alpha=0.3)
             ax.axhline(0, color="0.5", lw=0.8)
         self.ax_a.legend(loc="upper left", fontsize=8, ncol=3)
-        self.big = self.fig.text(0.90, 0.70, "", ha="center", va="center", fontsize=64,
-                                 fontweight="bold", color="tab:purple")
-        self.small = self.fig.text(0.90, 0.52, "", ha="center", va="top", fontsize=11, color="0.3")
+        self.big = self.ax_p.text(0.97, 0.97, "", transform=self.ax_p.transAxes, ha="right", va="top",
+                                  fontsize=54, fontweight="bold", color="tab:purple", alpha=0.85)
+        self.small = self.ax_p.text(0.97, 0.78, "", transform=self.ax_p.transAxes, ha="right", va="top",
+                                    fontsize=10, color="0.3")
         self.title = self.fig.suptitle(tracker.status, fontsize=9)
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
         self.fig.canvas.mpl_connect("close_event", lambda e: setattr(self, "quit", True))
@@ -613,6 +862,18 @@ class Canvas:
             if not self.t.calibrated:
                 self.t.accept_any_pose = True
                 self.message = "Taking your grip as it is."
+        elif k == "m":
+            self.rec = None
+            self.clear_canvas()
+            self.message = ""
+            self.t.start_mag_calibration()
+        elif k == "r":
+            if self.rec is None:
+                self.t.recenter()
+        elif k == "x":
+            self.t.flip_x *= -1
+        elif k == "y":
+            self.t.flip_y *= -1
         elif k == "q":
             self.quit = True
  
@@ -620,9 +881,12 @@ class Canvas:
         if not self.t.calibrated:
             self.message = "Finish calibration first: hold the pen still in your grip."
             return
-        self.rec = {"label": self.label, "t": [], "acc": [], "gyr": [], "acc_pen": [], "gyr_pen": [],
-                    "acc_s": [], "gyr_s": []}
+        self.t.recenter()                      # every letter starts in the middle of the path view
+        self.rec = {"label": self.label, "t": [], "acc": [], "gyr": [], "mag": [], "acc_pen": [], "gyr_pen": [],
+                    "acc_s": [], "gyr_s": [], "x": [], "y": []}
         self.clear_canvas()
+        if self.t.has_path:
+            self.start_dot.set_data([0], [0])
         ang = self.t.rest_error(self.t.acc_lp)
         warn = f" Careful: you started {ang:.0f} deg away from your rest grip." if ang > START_WARN else ""
         self.message = f"WRITING... press SPACE when done.{warn}"
@@ -674,6 +938,9 @@ class Canvas:
         r["gyr_pen"].append(g_pen)
         r["acc_s"].append(a_s)
         r["gyr_s"].append(g_s)
+        r["mag"].append(None if self.t.mag_raw is None else self.t.mag_raw.tolist())
+        r["x"].append(self.t.x)
+        r["y"].append(self.t.y)
  
     def live_predict(self):
         """While writing: guess from what's there so far."""
@@ -685,6 +952,8 @@ class Canvas:
  
     def clear_canvas(self):
         self.frozen = None
+        self.path_line.set_data([], [])
+        self.start_dot.set_data([], [])
         self.big.set_text("")
         self.small.set_text("")
  
@@ -708,12 +977,23 @@ class Canvas:
         ref = normalise(self.model.knn_raw[ref_i].astype(float))
         ref_lab = self.model.classes[self.model.knn_y[ref_i]]
         t = np.array(r["t"])
-        fig = plt.figure(figsize=(14, 6))
+        fig = plt.figure(figsize=(17, 6))
+        axp = fig.add_subplot(2, 4, (1, 5))
+        if r["x"] and self.t.has_path:
+            axp.plot(r["x"], r["y"], "-", lw=3, color="tab:blue")
+            axp.plot(r["x"][0], r["y"][0], "o", color="tab:green", label="start")
+            axp.plot(r["x"][-1], r["y"][-1], "s", color="tab:red", label="end")
+            axp.legend(loc="best", fontsize=8)
+        axp.set_aspect("equal", adjustable="datalim")
+        axp.grid(True, alpha=0.3)
+        axp.set_title("Pen-tip path (tilt + compass)", fontsize=9)
+        axp.set_xlabel("left / right (deg)")
+        axp.set_ylabel("down / up (deg)")
         steps = np.arange(T_STEPS)
         colors = ("tab:red", "tab:green", "tab:blue")
         for k, (key, sl, name, unit) in enumerate([("acc_s", slice(0, 3), "Accelerometer", "g"),
                                                   ("gyr_s", slice(3, 6), "Gyro", "deg/s")]):
-            ax = fig.add_subplot(2, 3, 1 + 3 * k)
+            ax = fig.add_subplot(2, 4, 2 + 4 * k)
             data = np.array(r[key])
             for j, c in enumerate(colors):
                 ax.plot(t, data[:, j], color=c, lw=1.8, label="xyz"[j])
@@ -721,7 +1001,7 @@ class Canvas:
                          fontsize=8)
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=7, ncol=3, loc="upper right")
-            ax = fig.add_subplot(2, 3, 2 + 3 * k)
+            ax = fig.add_subplot(2, 4, 3 + 4 * k)
             for j, c in enumerate(colors):
                 ax.plot(steps, mine[:, sl][:, j], color=c, lw=2, label=f"you {'xyz'[j]}")
                 ax.plot(steps, ref[:, sl][:, j], color=c, lw=1.2, ls="--", label=f"raw '{ref_lab}' {'xyz'[j]}")
@@ -732,7 +1012,7 @@ class Canvas:
                 ax.legend(fontsize=6, ncol=2, loc="upper right")
         fig.axes[-2].set_xlabel("time (s)")
         fig.axes[-1].set_xlabel(f"time step (letter trimmed and stretched to {T_STEPS})")
-        ax3 = fig.add_subplot(2, 3, (3, 6))
+        ax3 = fig.add_subplot(2, 4, (4, 8))
         labs = [l for l, _ in res["top"]][::-1]
         vals = [p for _, p in res["top"]][::-1]
         ax3.barh(labs, vals, color=["tab:purple" if l == best else "0.6" for l in labs])
@@ -760,7 +1040,10 @@ class Canvas:
                         "acc_pen_smoothed_g": np.round(r["acc_s"], 4).tolist(),
                         "gyro_pen_smoothed_dps": np.round(r["gyr_s"], 2).tolist(),
                         "raw_style_note": "acc_counts/gyro_counts are in the raw data's pen axes and counts",
-                        "acc_counts": np.round(acc_raw).tolist(), "gyro_counts": np.round(gyr_raw).tolist()})
+                        "acc_counts": np.round(acc_raw).tolist(), "gyro_counts": np.round(gyr_raw).tolist(),
+                        "mag_uT": r["mag"],
+                        "strokePoints": [{"x": round(float(a), 3), "y": round(float(b), 3)}
+                                         for a, b in zip(r["x"], r["y"])]})
         path = os.path.join(HERE, f"predictions_{time.strftime('%Y%m%d_%H%M%S')}.json")
         with open(path, "w") as f:
             json.dump(out, f)
@@ -790,6 +1073,21 @@ class Canvas:
         else:
             for ln in self.lines_a + self.lines_g:
                 ln.set_data([], [])
+        # path
+        if self.rec is not None and self.rec["x"] and self.t.has_path:
+            self.path_line.set_data(self.rec["x"], self.rec["y"])
+        if self.t.has_path and self.t.calibrated:
+            self.cursor.set_data([self.t.x], [self.t.y])
+            self.no_path.set_text("")
+            lim = max(VIEW, abs(self.t.x) + 5, abs(self.t.y) + 5)
+            if lim > self.ax_p.get_xlim()[1]:
+                self.ax_p.set_xlim(-lim, lim)
+                self.ax_p.set_ylim(-lim, lim)
+        else:
+            self.cursor.set_data([], [])
+            self.no_path.set_text("" if self.t.stage != "ready" else
+                                  "No compass data:\nflash firmware/MagicWandPen\n(it streams mx, my, mz)")
+        self.cursor.set_color("tab:red" if self.rec is not None else "tab:gray")
         rec_color = "mistyrose" if self.rec is not None else "white"
         self.ax_a.set_facecolor(rec_color)
         self.ax_g.set_facecolor(rec_color)
@@ -839,7 +1137,7 @@ def run_usb(port, model):
                 if not line or line.startswith("#"):
                     continue
                 try:
-                    v = [float(x) for x in line.split(",")[:7]]
+                    v = [float(x) for x in line.split(",")[:10]]
                 except ValueError:
                     continue
                 if len(v) < 7:
@@ -849,7 +1147,7 @@ def run_usb(port, model):
                 last_ms = ms
                 if not 0 < dt < 0.2:
                     continue
-                tracker.update(dt, v[1:4], v[4:7])
+                tracker.update(dt, v[1:4], v[4:7], v[7:10] if len(v) >= 10 else None)
                 canvas.add_sample(dt, v[1:4], v[4:7])
             now = time.time()
             if now - last_draw > 1 / FPS:
@@ -874,8 +1172,9 @@ async def run_ble(model):
     samples = deque()
  
     def on_data(_, data: bytearray):
-        seq, flags, ax, ay, az, gx, gy, gz, *_m = struct.unpack(PACKET_FMT, data[:PACKET_LEN])
-        samples.append((seq, (ax / 1000, ay / 1000, az / 1000), (gx / 10, gy / 10, gz / 10)))
+        seq, flags, ax, ay, az, gx, gy, gz, mx, my, mz = struct.unpack(PACKET_FMT, data[:PACKET_LEN])
+        samples.append((seq, (ax / 1000, ay / 1000, az / 1000), (gx / 10, gy / 10, gz / 10),
+                        (mx / 10, my / 10, mz / 10)))
  
     tracker = PenTracker(model.ref_up)
     canvas = Canvas(tracker, model)
@@ -885,12 +1184,12 @@ async def run_ble(model):
         print("Connected over Bluetooth. Hold the pen still in your writing grip...")
         while client.is_connected and not canvas.quit and plt.fignum_exists(canvas.fig.number):
             while samples:
-                seq, acc, gyr = samples.popleft()
+                seq, acc, gyr, mag = samples.popleft()
                 steps = 1 if last_seq is None else (seq - last_seq) % 256
                 last_seq = seq
                 if not 0 < steps < 20:
                     continue
-                tracker.update(0.01 * steps, acc, gyr)
+                tracker.update(0.01 * steps, acc, gyr, mag)
                 canvas.add_sample(0.01 * steps, acc, gyr)
             canvas.redraw()
             await asyncio.sleep(1 / FPS)
